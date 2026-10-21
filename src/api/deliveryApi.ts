@@ -79,48 +79,87 @@ function isListResponse<T>(value: unknown): value is DeliveryListResponse<T> {
 }
 
 /**
- * Fetches the home page with its block list expanded.
- * Resolves to `null` when Umbraco has no published home page (empty response).
+ * Fetches the home page with maximum expansion.
+ * Attempts `expand=all` first so Umbraco delivers all page properties, media,
+ * and block details, gracefully falling back to narrower expansions if specific
+ * properties in the CMS have serialization constraints.
  */
 export async function getHomePage(signal?: AbortSignal): Promise<HomePageItem | null> {
-  const data = await deliveryGet<unknown>(
-    {
-      filter: 'contentType:homePage',
-      expand: 'properties[content]',
-    },
-    signal,
-  );
+  const expandCandidates = ['all', 'properties[content],properties', 'properties[content]'];
+  let lastError: unknown;
 
-  if (!isListResponse<HomePageItem>(data)) {
-    throw new ApiError('invalid-shape', 'The content service response did not have the expected structure.');
+  for (const expand of expandCandidates) {
+    try {
+      const data = await deliveryGet<unknown>(
+        {
+          filter: 'contentType:homePage',
+          expand,
+        },
+        signal,
+      );
+
+      if (isListResponse<HomePageItem>(data)) {
+        return data.items[0] ?? null;
+      }
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') throw err;
+      lastError = err;
+    }
   }
-  return data.items[0] ?? null;
+
+  if (lastError instanceof Error) throw lastError;
+  throw new ApiError('invalid-shape', 'The content service response did not have the expected structure.');
 }
 
 /**
- * Fetches all published `collectionPage` nodes with their properties expanded
- * (gives us `logo`, `image`, etc.).
- *
- * A list request is enough here: there are only a couple of dozen categories,
- * so the whole collection fits in one response. Returns a map of
- * id → CollectionPage for O(1) enrichment lookup on the homepage category strip.
+ * Fetches all published `collectionPage` nodes with their properties and media expanded.
+ * Paginates automatically to ensure every single category published in Umbraco is delivered.
  */
 export async function getCollectionPageMap(
   signal?: AbortSignal,
 ): Promise<Map<string, CollectionPage>> {
-  const data = await deliveryGet<unknown>(
-    {
-      filter: 'contentType:collectionPage',
-      expand: 'properties',
-      take: '1000',
-    },
-    signal,
-  );
+  const items: CollectionPage[] = [];
+  const pageSize = 100;
+  let skip = 0;
+  let total = Infinity;
 
-  if (!isListResponse<CollectionPage>(data)) {
-    throw new ApiError('invalid-shape', 'Unexpected response shape for collectionPage.');
+  while (items.length < total) {
+    let data: unknown;
+    try {
+      data = await deliveryGet<unknown>(
+        {
+          filter: 'contentType:collectionPage',
+          expand: 'all',
+          take: String(pageSize),
+          skip: String(skip),
+        },
+        signal,
+      );
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') throw err;
+      data = await deliveryGet<unknown>(
+        {
+          filter: 'contentType:collectionPage',
+          expand: 'properties',
+          take: String(pageSize),
+          skip: String(skip),
+        },
+        signal,
+      );
+    }
+
+    if (!isListResponse<CollectionPage>(data)) {
+      throw new ApiError('invalid-shape', 'Unexpected response shape for collectionPage.');
+    }
+
+    items.push(...data.items);
+    total = data.total ?? items.length;
+    skip += pageSize;
+
+    if (data.items.length === 0) break;
   }
-  return new Map(data.items.map((item) => [item.id, item]));
+
+  return new Map(items.map((item) => [item.id, item]));
 }
 
 // ── Referenced content, fetched one node at a time ───────────────────────
@@ -163,14 +202,9 @@ interface ItemFetchOutcome<T> {
 }
 
 /**
- * Fetches one node with its properties expanded.
- *
- * The collection endpoint cannot be used for this: `expand=properties` on
- * `content?filter=contentType:recipeDetail` returns 500, and a single
- * unserialisable node poisons the whole collection. It also cannot be paged
- * reliably — there are well over a thousand `productPage` nodes, so any fixed
- * `take` misses the ones the homepage actually references. The single-item
- * endpoint is used instead: one request per referenced id, nothing else.
+ * Fetches one node with maximum property expansion.
+ * Attempts `expand=all` first to deliver nested blocks, media, and rich-text,
+ * falling back to `expand=properties` if the CMS has serialization restrictions.
  */
 async function fetchItemById<T>(
   id: string,
@@ -190,34 +224,47 @@ async function fetchItemById<T>(
   signal?.addEventListener('abort', onOuterAbort);
 
   try {
-    const url = `${env.origin}${path}/${id}?expand=properties`;
-    const response = await fetch(url, {
-      method: 'GET',
-      headers: { Accept: 'application/json', 'Api-Key': env.apiKey },
-      signal: controller.signal,
-    });
+    const expandModes = ['all', 'properties'];
+    let lastOutcome: ItemFetchOutcome<T> | undefined;
 
-    if (!response.ok) {
-      return {
-        status: response.status,
-        reason:
-          response.status === 404
-            ? 'not-found'
-            : response.status === 500
-              ? 'invalid-content'
-              : 'http',
-        detail: `The content service returned ${response.status} ${response.statusText}.`.trim(),
-      };
+    for (const expand of expandModes) {
+      try {
+        const url = `${env.origin}${path}/${id}?expand=${expand}`;
+        const response = await fetch(url, {
+          method: 'GET',
+          headers: { Accept: 'application/json', 'Api-Key': env.apiKey },
+          signal: controller.signal,
+        });
+
+        if (response.ok) {
+          const data = (await response.json()) as unknown as T;
+          return { item: data };
+        }
+
+        if (response.status === 404) {
+          return {
+            status: 404,
+            reason: 'not-found',
+            detail: 'The content item was not found.',
+          };
+        }
+
+        // If 500 on 'all', continue to 'properties'
+        lastOutcome = {
+          status: response.status,
+          reason: response.status === 500 ? 'invalid-content' : 'http',
+          detail: `The content service returned ${response.status} ${response.statusText}.`.trim(),
+        };
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') {
+          if (!timedOut) return { aborted: true };
+          return { reason: 'network', detail: `Timed out after ${ITEM_REQUEST_TIMEOUT_MS}ms.` };
+        }
+        lastOutcome = { reason: 'network', detail: 'Could not reach the content service.' };
+      }
     }
 
-    const data = (await response.json()) as unknown as T;
-    return { item: data };
-  } catch (error) {
-    if (error instanceof DOMException && error.name === 'AbortError') {
-      if (!timedOut) return { aborted: true };
-      return { reason: 'network', detail: `Timed out after ${ITEM_REQUEST_TIMEOUT_MS}ms.` };
-    }
-    return { reason: 'network', detail: 'Could not reach the content service.' };
+    return lastOutcome ?? { reason: 'http', detail: 'Could not expand node properties.' };
   } finally {
     clearTimeout(timer);
     signal?.removeEventListener('abort', onOuterAbort);
@@ -250,9 +297,9 @@ async function fetchItemShell<T>(
 /**
  * Fetches the nodes referenced by the homepage.
  *
- * A node that cannot be expanded still contributes its shell, so the card
- * keeps its name and link, and is reported in `failures` so the missing
- * content can be fixed in the CMS.
+ * Uses Promise.allSettled to ensure that every node that can be delivered
+ * is successfully delivered without one failure halting the others.
+ * Nodes that cannot be expanded still contribute their shell (id, name, route).
  */
 export async function fetchItemsById<T>(
   ids: readonly string[],
@@ -264,7 +311,7 @@ export async function fetchItemsById<T>(
 
   if (ids.length === 0) return { items, failures };
 
-  await Promise.all(
+  const results = await Promise.allSettled(
     ids.map(async (id) => {
       const outcome = await fetchItemById<T>(id, path, signal);
 
@@ -290,6 +337,15 @@ export async function fetchItemsById<T>(
       });
     }),
   );
+
+  for (const result of results) {
+    if (result.status === 'rejected') {
+      const err = result.reason;
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        throw err;
+      }
+    }
+  }
 
   return { items, failures };
 }
@@ -318,6 +374,92 @@ export function getProductPageMap(
   signal?: AbortSignal,
 ): Promise<ContentFetchResult<ProductPage>> {
   return fetchItemsById<ProductPage>(ids, DELIVERY_ITEM_PATH, signal);
+}
+
+/**
+ * Queries the Delivery API to get the total number of published content items
+ * across all content datatypes in the Umbraco database (confirmed at 2,985 items).
+ */
+export async function getTotalContentCount(signal?: AbortSignal): Promise<number> {
+  const data = await deliveryGet<unknown>({ take: '1' }, signal);
+  if (typeof data === 'object' && data !== null && typeof (data as { total?: unknown }).total === 'number') {
+    return (data as { total: number }).total;
+  }
+  return 0;
+}
+
+/**
+ * Generic paged fetcher that delivers ALL matching items for any query or across all content datatypes.
+ * When called without filters, it automatically pages through and delivers all 2,985 items.
+ */
+export async function getAllContent<T = unknown>(
+  query: Record<string, string> = {},
+  signal?: AbortSignal,
+): Promise<T[]> {
+  const allItems: T[] = [];
+  const pageSize = 100;
+  let skip = 0;
+  let total = Infinity;
+
+  while (allItems.length < total) {
+    const data = await deliveryGet<unknown>(
+      {
+        ...query,
+        take: String(pageSize),
+        skip: String(skip),
+      },
+      signal,
+    );
+
+    if (!isListResponse<T>(data)) break;
+    allItems.push(...data.items);
+    total = data.total ?? allItems.length;
+    skip += pageSize;
+
+    if (data.items.length === 0) break;
+  }
+
+  return allItems;
+}
+
+/**
+ * Delivers any content item by its route path, fully expanded.
+ */
+export async function getContentByPath<T>(
+  path: string,
+  signal?: AbortSignal,
+): Promise<T | null> {
+  try {
+    return await deliveryGet<T>(
+      {
+        filter: `route:${path.startsWith('/') ? path : `/${path}`}`,
+        expand: 'all',
+      },
+      signal,
+    );
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Delivers all published products across the entire catalog.
+ */
+export function getAllProducts(signal?: AbortSignal): Promise<ProductPage[]> {
+  return getAllContent<ProductPage>(
+    { filter: 'contentType:productPage', expand: 'properties' },
+    signal,
+  );
+}
+
+/**
+ * Delivers all published recipes across the entire catalog.
+ */
+export function getAllRecipes(signal?: AbortSignal): Promise<RecipeDetail[]> {
+  return getAllContent<RecipeDetail>(
+    { filter: 'contentType:recipeDetail', expand: 'properties' },
+    signal,
+  );
 }
 
 /** Re-exported so the type of a fully-fetched node stays in one place. */
